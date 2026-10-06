@@ -1,0 +1,316 @@
+import { Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView, TextEdit } from "std-widgets.slint";
+
+export struct ChatRow {
+    title: string,
+}
+
+export struct Bubble {
+    role: string,
+    body: string,
+    sources: string,
+}
+
+export component AppWindow inherits Window {
+    title: "Rask";
+    preferred-width: 980px;
+    preferred-height: 720px;
+    min-width: 760px;
+    min-height: 520px;
+    icon: @image-url("icon.png");
+    background: Palette.background;
+
+    in-out property <bool> settings-open: false;
+    in-out property <bool> history-open: true;
+    in-out property <bool> busy: false;
+    in-out property <string> status: "";
+    in-out property <[ChatRow]> chats;
+    in-out property <[Bubble]> messages;
+    in-out property <[string]> model-names: ["No models"];
+    in-out property <int> model-index: 0;
+    in-out property <int> default-index: 0;
+    in-out property <length> scroll-y: 0px;
+
+    in-out property <string> ollama-url: "http://127.0.0.1:11434";
+    in-out property <string> idle-unload: "10m";
+    in-out property <bool> autostart: false;
+    in-out property <bool> start-minimized: true;
+    in-out property <int> provider-index: 0;
+    in-out property <string> api-key: "";
+    in-out property <string> system-prompt: "";
+    in-out property <string> temperature: "0.7";
+    in-out property <string> num-ctx: "8192";
+    in-out property <bool> think: false;
+
+    callback send(string);
+    callback stop();
+    callback new-chat();
+    callback pick-chat(int);
+    callback pick-model(int);
+    callback apply-settings();
+    callback refresh-models();
+    callback open-key-page();
+
+    HorizontalLayout {
+        if root.history-open: Rectangle {
+            width: 232px;
+            background: Palette.alternate-background;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+                Text {
+                    text: "Rask";
+                    font-size: 18px;
+                    font-weight: 600;
+                }
+                Button {
+                    text: "New chat";
+                    clicked => { root.new-chat(); }
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 2px;
+                        for chat[i] in root.chats: chat-row := Rectangle {
+                            VerticalLayout {
+                                padding: 8px;
+                                padding-top: 7px;
+                                padding-bottom: 7px;
+                                Text {
+                                    text: chat.title;
+                                    overflow: elide;
+                                    wrap: no-wrap;
+                                }
+                            }
+                            TouchArea {
+                                clicked => { root.pick-chat(i); }
+                                mouse-cursor: pointer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            HorizontalLayout {
+                padding: 10px;
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 8px;
+                alignment: center;
+                Button {
+                    text: root.history-open ? "Hide" : "Chats";
+                    clicked => { root.history-open = !root.history-open; }
+                }
+                ComboBox {
+                    model: root.model-names;
+                    current-index: root.model-index;
+                    selected(name) => { root.pick-model(self.current-index); }
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: root.settings-open ? "Chat" : "Settings";
+                    clicked => { root.settings-open = !root.settings-open; }
+                }
+            }
+
+            if !root.settings-open: VerticalLayout {
+                vertical-stretch: 1;
+                transcript := Flickable {
+                    vertical-stretch: 1;
+                    content-height: max(transcript.height, msg-col.preferred-height);
+                    content-y <=> root.scroll-y;
+                    msg-col := VerticalLayout {
+                        width: transcript.width;
+                        padding: 8px;
+                        padding-left: 28px;
+                        padding-right: 28px;
+                        padding-bottom: 12px;
+                        spacing: 18px;
+                        alignment: start;
+                        if root.messages.length == 0: VerticalLayout {
+                            padding-top: 48px;
+                            Text {
+                                text: "Ask something.";
+                                horizontal-alignment: center;
+                                font-size: 16px;
+                            }
+                        }
+                        for msg in root.messages: VerticalLayout {
+                            spacing: 4px;
+                            alignment: start;
+                            Text {
+                                text: msg.role;
+                                font-size: 12px;
+                                font-weight: 600;
+                            }
+                            Text {
+                                text: msg.body;
+                                wrap: word-wrap;
+                                font-size: 15px;
+                            }
+                            if msg.sources != "": Text {
+                                text: msg.sources;
+                                wrap: word-wrap;
+                                font-size: 12px;
+                            }
+                        }
+                    }
+                }
+
+                if root.status != "": Text {
+                    text: root.status;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    padding: 14px;
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    spacing: 8px;
+                    alignment: center;
+                    composer := LineEdit {
+                        horizontal-stretch: 1;
+                        placeholder-text: "Ask Rask";
+                        enabled: !root.busy;
+                        accepted(t) => {
+                            if !root.busy && t != "" {
+                                root.send(t);
+                                self.text = "";
+                            }
+                        }
+                    }
+                    if !root.busy: Button {
+                        text: "Send";
+                        primary: true;
+                        clicked => {
+                            if composer.text != "" {
+                                root.send(composer.text);
+                                composer.text = "";
+                            }
+                        }
+                    }
+                    if root.busy: Button {
+                        text: "Stop";
+                        clicked => { root.stop(); }
+                    }
+                }
+            }
+
+            if root.settings-open: ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding: 28px;
+                    spacing: 8px;
+                    alignment: start;
+                    Text {
+                        text: "Settings";
+                        font-size: 22px;
+                    }
+                    Text { text: "Ollama URL"; font-size: 12px; }
+                    LineEdit { text <=> root.ollama-url; }
+                    Text { text: "Unload the model after"; font-size: 12px; }
+                    LineEdit { text <=> root.idle-unload; }
+                    Text {
+                        text: "Ollama drops the model from memory after this idle time. Use 10m, 30m, or 0 to unload when the reply finishes.";
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    CheckBox {
+                        text: "Start when I log in";
+                        checked <=> root.autostart;
+                    }
+                    CheckBox {
+                        text: "Start minimized to the tray";
+                        checked <=> root.start-minimized;
+                    }
+                    Text { text: "Default model for new chats"; font-size: 12px; }
+                    ComboBox {
+                        model: root.model-names;
+                        current-index: root.default-index;
+                        selected(name) => { root.default-index = self.current-index; }
+                    }
+                    Text { text: "Search provider"; font-size: 12px; }
+                    ComboBox {
+                        model: ["Ollama", "Tavily", "Brave", "You.com"];
+                        current-index: root.provider-index;
+                        selected(name) => { root.provider-index = self.current-index; }
+                    }
+                    Text { text: "Search API key"; font-size: 12px; }
+                    LineEdit { text <=> root.api-key; }
+                    Button {
+                        text: "Open key page";
+                        clicked => { root.open-key-page(); }
+                    }
+                    Text {
+                        text: "A model that supports tools decides when to search. Only the search query leaves this machine, and only to the provider above. The model stays local. Without a key, Rask still chats.";
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "Selected model";
+                        font-size: 18px;
+                    }
+                    Text { text: "System prompt"; font-size: 12px; }
+                    TextEdit {
+                        text <=> root.system-prompt;
+                        height: 110px;
+                    }
+                    Text { text: "Temperature"; font-size: 12px; }
+                    LineEdit { text <=> root.temperature; }
+                    Text { text: "Context length"; font-size: 12px; }
+                    LineEdit { text <=> root.num-ctx; }
+                    CheckBox {
+                        text: "Thinking (off is faster)";
+                        checked <=> root.think;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Button {
+                            text: "Refresh models";
+                            clicked => { root.refresh-models(); }
+                        }
+                        Button {
+                            text: "Apply";
+                            primary: true;
+                            clicked => { root.apply-settings(); }
+                        }
+                    }
+                    Text {
+                        text: root.status;
+                        wrap: word-wrap;
+                        font-size: 12px;
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component RaskTray inherits SystemTrayIcon {
+    icon: @image-url("icon.png");
+    in-out property <string> tray-tooltip <=> self.tooltip;
+
+    callback show-window();
+    callback unload();
+    callback quit();
+
+    clicked => { root.show-window(); }
+
+    Menu {
+        MenuItem {
+            title: "Open";
+            activated => { root.show-window(); }
+        }
+        MenuItem {
+            title: "Unload model";
+            activated => { root.unload(); }
+        }
+        MenuSeparator {}
+        MenuItem {
+            title: "Quit";
+            activated => { root.quit(); }
+        }
+    }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "rask"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT"
+description = "A quiet native chat for Ollama. Capable models search the web on their own."
+authors = ["abb0r"]
+repository = "https://github.com/abb0r/rask"
+readme = "README.md"
+
+[dependencies]
+dirs = "6"
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+slint = "1.18.1"
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+slint-build = "1.18.1"
