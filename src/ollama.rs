@@ -22,7 +22,7 @@ pub fn normalize_base(url: &str) -> String {
 
 fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        .timeout(std::time::Duration::from_secs(30 * 60))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| e.to_string())

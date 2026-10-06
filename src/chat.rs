@@ -25,7 +25,6 @@ pub struct TurnView {
     pub text: String,
     pub sources: Vec<Hit>,
     pub status: String,
-    pub done: bool,
 }
 
 pub fn run(
@@ -70,10 +69,11 @@ Cite the URLs you actually used. If the results do not contain the answer, say s
                     sources: sources.clone(),
                     status: if text.is_empty() && !partial.thinking.is_empty() {
                         "Thinking…".into()
+                    } else if text.is_empty() {
+                        "Waiting for the model…".into()
                     } else {
                         String::new()
                     },
-                    done: false,
                 });
             },
             cancel,
@@ -86,7 +86,6 @@ Cite the URLs you actually used. If the results do not contain the answer, say s
                 text: visible_text(&partial),
                 sources: sources.clone(),
                 status,
-                done: false,
             });
             messages.push(assistant_tool_message(&partial));
             messages.extend(tool_messages);
@@ -101,7 +100,6 @@ Cite the URLs you actually used. If the results do not contain the answer, say s
         text: final_text,
         sources,
         status: String::new(),
-        done: true,
     });
     Ok(())
 }

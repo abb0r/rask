@@ -10,25 +10,151 @@ export struct Bubble {
     sources: string,
 }
 
+component ChatColumn inherits Rectangle {
+    in property <bool> busy;
+    in property <int> scroll-tick;
+    in property <string> status;
+    in property <[Bubble]> messages;
+    in-out property <string> draft;
+    callback request-send();
+    callback request-stop();
+
+    function jump() {
+        transcript.content-y = min(0px, transcript.height - transcript.content-height);
+    }
+
+    changed scroll-tick => { root.jump(); }
+
+    Timer {
+        interval: 32ms;
+        running: root.busy;
+        triggered => { root.jump(); }
+    }
+
+    VerticalLayout {
+        width: parent.width;
+        height: parent.height;
+        transcript := Flickable {
+            vertical-stretch: 1;
+            content-height: max(transcript.height, msg-col.preferred-height);
+            msg-col := VerticalLayout {
+                width: transcript.width;
+                padding: 8px;
+                padding-left: 28px;
+                padding-right: 28px;
+                padding-bottom: 12px;
+                spacing: 18px;
+                alignment: start;
+                if root.messages.length == 0: VerticalLayout {
+                    padding-top: 48px;
+                    Text {
+                        text: "Ask something.";
+                        horizontal-alignment: center;
+                        font-size: 16px;
+                    }
+                }
+                for msg in root.messages: VerticalLayout {
+                    spacing: 4px;
+                    alignment: start;
+                    Text {
+                        text: msg.role;
+                        font-size: 12px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: msg.body;
+                        wrap: word-wrap;
+                        font-size: 15px;
+                    }
+                    if msg.sources != "": Text {
+                        text: msg.sources;
+                        wrap: word-wrap;
+                        font-size: 12px;
+                    }
+                }
+            }
+        }
+
+        if root.status != "": HorizontalLayout {
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-bottom: 4px;
+            Text {
+                text: root.status;
+                font-size: 13px;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+            }
+        }
+
+        VerticalLayout {
+            padding: 12px;
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-bottom: 16px;
+            spacing: 6px;
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                composer := TextEdit {
+                    text <=> root.draft;
+                    horizontal-stretch: 1;
+                    vertical-stretch: 0;
+                    height: 120px;
+                    font-size: 15px;
+                    wrap: word-wrap;
+                    placeholder-text: "Ask Rask";
+                    key-pressed(event) => {
+                        if event.text == Key.Return && !event.modifiers.shift {
+                            root.request-send();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
+                if !root.busy: Button {
+                    text: "Send";
+                    primary: true;
+                    clicked => { root.request-send(); }
+                }
+                if root.busy: Button {
+                    text: "Stop";
+                    clicked => { root.request-stop(); }
+                }
+            }
+            Text {
+                text: "Enter to send. Shift+Enter for a new line.";
+                font-size: 12px;
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Rask";
     preferred-width: 980px;
-    preferred-height: 720px;
+    preferred-height: 760px;
     min-width: 760px;
-    min-height: 520px;
+    min-height: 620px;
     icon: @image-url("icon.png");
     background: Palette.background;
 
     in-out property <bool> settings-open: false;
     in-out property <bool> history-open: true;
     in-out property <bool> busy: false;
+    in-out property <bool> suppress-persist: false;
+    in-out property <int> scroll-tick: 0;
     in-out property <string> status: "";
+    in-out property <string> draft: "";
+    in-out property <string> app-version: "";
+    in-out property <string> update-version: "";
+    in-out property <bool> update-busy: false;
     in-out property <[ChatRow]> chats;
     in-out property <[Bubble]> messages;
     in-out property <[string]> model-names: ["No models"];
     in-out property <int> model-index: 0;
     in-out property <int> default-index: 0;
-    in-out property <length> scroll-y: 0px;
 
     in-out property <string> ollama-url: "http://127.0.0.1:11434";
     in-out property <string> idle-unload: "10m";
@@ -46,9 +172,21 @@ export component AppWindow inherits Window {
     callback new-chat();
     callback pick-chat(int);
     callback pick-model(int);
-    callback apply-settings();
+    callback persist();
+    callback persist-autostart();
     callback refresh-models();
     callback open-key-page();
+    callback install-update();
+
+    function submit() {
+        if !root.busy && root.draft != "" {
+            root.send(root.draft);
+        }
+    }
+
+    public function scroll-to-bottom() {
+        root.scroll-tick += 1;
+    }
 
     HorizontalLayout {
         if root.history-open: Rectangle {
@@ -114,88 +252,37 @@ export component AppWindow inherits Window {
                 }
             }
 
-            if !root.settings-open: VerticalLayout {
-                vertical-stretch: 1;
-                transcript := Flickable {
-                    vertical-stretch: 1;
-                    content-height: max(transcript.height, msg-col.preferred-height);
-                    content-y <=> root.scroll-y;
-                    msg-col := VerticalLayout {
-                        width: transcript.width;
-                        padding: 8px;
-                        padding-left: 28px;
-                        padding-right: 28px;
-                        padding-bottom: 12px;
-                        spacing: 18px;
-                        alignment: start;
-                        if root.messages.length == 0: VerticalLayout {
-                            padding-top: 48px;
-                            Text {
-                                text: "Ask something.";
-                                horizontal-alignment: center;
-                                font-size: 16px;
-                            }
-                        }
-                        for msg in root.messages: VerticalLayout {
-                            spacing: 4px;
-                            alignment: start;
-                            Text {
-                                text: msg.role;
-                                font-size: 12px;
-                                font-weight: 600;
-                            }
-                            Text {
-                                text: msg.body;
-                                wrap: word-wrap;
-                                font-size: 15px;
-                            }
-                            if msg.sources != "": Text {
-                                text: msg.sources;
-                                wrap: word-wrap;
-                                font-size: 12px;
-                            }
-                        }
-                    }
-                }
-
-                if root.status != "": Text {
-                    text: root.status;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
-
+            if root.update-version != "": Rectangle {
+                background: Palette.alternate-background;
                 HorizontalLayout {
-                    padding: 14px;
-                    padding-left: 20px;
-                    padding-right: 20px;
+                    padding: 8px;
+                    padding-left: 14px;
+                    padding-right: 14px;
                     spacing: 8px;
                     alignment: center;
-                    composer := LineEdit {
+                    Text {
+                        text: "Version " + root.update-version + " is available.";
                         horizontal-stretch: 1;
-                        placeholder-text: "Ask Rask";
-                        enabled: !root.busy;
-                        accepted(t) => {
-                            if !root.busy && t != "" {
-                                root.send(t);
-                                self.text = "";
-                            }
-                        }
+                        vertical-alignment: center;
                     }
-                    if !root.busy: Button {
-                        text: "Send";
+                    Button {
+                        text: root.update-busy ? "Downloading…" : "Install";
+                        enabled: !root.update-busy;
                         primary: true;
-                        clicked => {
-                            if composer.text != "" {
-                                root.send(composer.text);
-                                composer.text = "";
-                            }
-                        }
-                    }
-                    if root.busy: Button {
-                        text: "Stop";
-                        clicked => { root.stop(); }
+                        clicked => { root.install-update(); }
                     }
                 }
+            }
+
+            if !root.settings-open: ChatColumn {
+                vertical-stretch: 1;
+                busy: root.busy;
+                scroll-tick: root.scroll-tick;
+                status: root.status;
+                messages: root.messages;
+                draft <=> root.draft;
+                request-send => { root.submit(); }
+                request-stop => { root.stop(); }
             }
 
             if root.settings-open: ScrollView {
@@ -205,13 +292,25 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     alignment: start;
                     Text {
-                        text: "Settings";
+                        text: "Rask " + root.app-version;
                         font-size: 22px;
                     }
+                    Text {
+                        text: "Changes are saved on this PC as you edit them.";
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
                     Text { text: "Ollama URL"; font-size: 12px; }
-                    LineEdit { text <=> root.ollama-url; }
+                    LineEdit {
+                        text <=> root.ollama-url;
+                        edited(value) => { root.persist(); }
+                        accepted(value) => { root.refresh-models(); }
+                    }
                     Text { text: "Unload the model after"; font-size: 12px; }
-                    LineEdit { text <=> root.idle-unload; }
+                    LineEdit {
+                        text <=> root.idle-unload;
+                        edited(value) => { root.persist(); }
+                    }
                     Text {
                         text: "Ollama drops the model from memory after this idle time. Use 10m, 30m, or 0 to unload when the reply finishes.";
                         font-size: 12px;
@@ -220,25 +319,43 @@ export component AppWindow inherits Window {
                     CheckBox {
                         text: "Start when I log in";
                         checked <=> root.autostart;
+                        toggled => { root.persist-autostart(); }
                     }
                     CheckBox {
                         text: "Start minimized to the tray";
                         checked <=> root.start-minimized;
+                        toggled => { root.persist-autostart(); }
                     }
                     Text { text: "Default model for new chats"; font-size: 12px; }
                     ComboBox {
                         model: root.model-names;
                         current-index: root.default-index;
-                        selected(name) => { root.default-index = self.current-index; }
+                        selected(name) => {
+                            root.default-index = self.current-index;
+                            root.persist();
+                        }
                     }
                     Text { text: "Search provider"; font-size: 12px; }
                     ComboBox {
                         model: ["Ollama", "Tavily", "Brave", "You.com"];
                         current-index: root.provider-index;
-                        selected(name) => { root.provider-index = self.current-index; }
+                        selected(name) => {
+                            root.provider-index = self.current-index;
+                            root.persist();
+                        }
                     }
                     Text { text: "Search API key"; font-size: 12px; }
-                    LineEdit { text <=> root.api-key; }
+                    LineEdit {
+                        text <=> root.api-key;
+                        edited(value) => {
+                            root.api-key = value;
+                            root.persist();
+                        }
+                    }
+                    Text {
+                        text: root.api-key == "" ? "No search key saved." : "Search key saved on this PC.";
+                        font-size: 12px;
+                    }
                     Button {
                         text: "Open key page";
                         clicked => { root.open-key-page(); }
@@ -256,26 +373,27 @@ export component AppWindow inherits Window {
                     TextEdit {
                         text <=> root.system-prompt;
                         height: 110px;
+                        vertical-stretch: 0;
+                        edited(value) => { root.persist(); }
                     }
                     Text { text: "Temperature"; font-size: 12px; }
-                    LineEdit { text <=> root.temperature; }
+                    LineEdit {
+                        text <=> root.temperature;
+                        edited(value) => { root.persist(); }
+                    }
                     Text { text: "Context length"; font-size: 12px; }
-                    LineEdit { text <=> root.num-ctx; }
+                    LineEdit {
+                        text <=> root.num-ctx;
+                        edited(value) => { root.persist(); }
+                    }
                     CheckBox {
                         text: "Thinking (off is faster)";
                         checked <=> root.think;
+                        toggled => { root.persist(); }
                     }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Button {
-                            text: "Refresh models";
-                            clicked => { root.refresh-models(); }
-                        }
-                        Button {
-                            text: "Apply";
-                            primary: true;
-                            clicked => { root.apply-settings(); }
-                        }
+                    Button {
+                        text: "Refresh models";
+                        clicked => { root.refresh-models(); }
                     }
                     Text {
                         text: root.status;

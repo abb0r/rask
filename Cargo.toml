@@ -1,6 +1,6 @@
 [package]
 name = "rask"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT"
@@ -20,3 +20,6 @@ uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 slint-build = "1.18.1"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

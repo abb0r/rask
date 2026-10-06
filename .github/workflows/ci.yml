@@ -24,46 +24,28 @@ jobs:
         run: cargo test --locked
 
   release:
-    name: Build ${{ matrix.os }}
+    name: Windows installer
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact: linux-x86_64
-            src: target/release/rask
-          - os: windows-latest
-            artifact: windows-x86_64.exe
-            src: target/release/rask.exe
-          - os: macos-latest
-            artifact: macos-aarch64
-            src: target/release/rask
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: System libraries
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libfontconfig-dev libfreetype6-dev libx11-dev libxcb1-dev
       - name: Build
         run: cargo build --release --locked
-      - name: Stage
-        shell: bash
+      - name: Installer
+        shell: pwsh
         run: |
-          mkdir -p dist
-          cp "${{ matrix.src }}" "dist/rask-${GITHUB_REF_NAME}-${{ matrix.artifact }}"
-          if [[ "${RUNNER_OS}" != "Windows" ]]; then
-            chmod +x dist/*
-          fi
+          $ProgressPreference = "SilentlyContinue"
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe" -OutFile "$env:TEMP\innosetup.exe"
+          Start-Process "$env:TEMP\innosetup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-" -Wait
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$ver" packaging/windows/rask.iss
       - uses: actions/upload-artifact@v4
         with:
-          name: rask-${{ matrix.artifact }}
-          path: dist/*
+          name: rask-windows-setup
+          path: dist/Rask-Setup-*.exe
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: dist/Rask-Setup-*.exe
           generate_release_notes: true

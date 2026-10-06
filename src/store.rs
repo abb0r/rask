@@ -242,4 +242,15 @@ mod tests {
         assert!(!store.profile("missing").think);
         assert_eq!(store.profile("missing").num_ctx, 8192);
     }
+
+    #[test]
+    fn settings_roundtrip_keeps_key() {
+        let mut store = Store::default();
+        store.settings.search_api_key = "tvly-test".into();
+        store.settings.search_provider = "tavily".into();
+        let bytes = serde_json::to_vec(&store).unwrap();
+        let loaded: Store = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.settings.search_api_key, "tvly-test");
+        assert_eq!(provider_index(&loaded.settings.search_provider), 1);
+    }
 }

@@ -5,8 +5,10 @@ mod chat;
 mod ollama;
 mod search;
 mod store;
+mod update;
 
 use std::fs::OpenOptions;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +19,24 @@ use store::{Message, ModelProfile, Source, Store};
 
 slint::include_modules!();
 
+struct StreamSlot {
+    model: String,
+    view: chat::TurnView,
+    note: String,
+    error: Option<String>,
+    done: bool,
+    applied: bool,
+    painted: String,
+    painted_status: String,
+}
+
+struct AppState {
+    stream: Mutex<Option<StreamSlot>>,
+    update: Mutex<Option<update::Offer>>,
+    update_seen: AtomicBool,
+    download: Mutex<Option<Result<PathBuf, String>>>,
+}
+
 fn main() {
     let _instance = match instance_lock() {
         Ok(file) => file,
@@ -25,13 +45,22 @@ fn main() {
 
     let minimized = std::env::args().any(|arg| arg == "--minimized");
     let ui = AppWindow::new().expect("window");
+    ui.set_app_version(update::current_version().into());
     let tray = RaskTray::new().expect("tray");
     tray.set_tray_tooltip("Rask".into());
 
     let cancel = Arc::new(AtomicBool::new(false));
+    let app = Arc::new(AppState {
+        stream: Mutex::new(None),
+        update: Mutex::new(None),
+        update_seen: AtomicBool::new(false),
+        download: Mutex::new(None),
+    });
     load_settings_into(&ui);
     refresh_lists(&ui);
-    wire(&ui, &tray, cancel);
+    wire(&ui, &tray, cancel, app.clone());
+    start_poll(ui.as_weak(), app.clone());
+    start_update_check(app);
 
     ui.window()
         .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
@@ -56,7 +85,102 @@ fn instance_lock() -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-fn wire(ui: &AppWindow, tray: &RaskTray, cancel: Arc<AtomicBool>) {
+fn start_poll(weak: slint::Weak<AppWindow>, app: Arc<AppState>) {
+    let timer = Box::leak(Box::new(slint::Timer::default()));
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(50),
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            poll(&ui, &app);
+        },
+    );
+}
+
+fn start_update_check(app: Arc<AppState>) {
+    std::thread::spawn(move || {
+        if let Ok(Some(offer)) = update::check() {
+            if let Ok(mut slot) = app.update.lock() {
+                *slot = Some(offer);
+            }
+        }
+    });
+}
+
+fn poll(ui: &AppWindow, app: &AppState) {
+    if !app.update_seen.load(Ordering::Relaxed) {
+        if let Ok(slot) = app.update.lock() {
+            if let Some(offer) = slot.as_ref() {
+                ui.set_update_version(offer.version.clone().into());
+                app.update_seen.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    if let Ok(mut slot) = app.download.lock() {
+        if let Some(result) = slot.take() {
+            ui.set_update_busy(false);
+            match result {
+                Ok(path) => {
+                    if std::process::Command::new(&path).spawn().is_ok() {
+                        let _ = slint::quit_event_loop();
+                    } else {
+                        ui.set_status("Could not start the installer.".into());
+                        let _ = open::that("https://github.com/abb0r/rask/releases/latest");
+                    }
+                }
+                Err(err) => {
+                    ui.set_status(err.into());
+                    let _ = open::that("https://github.com/abb0r/rask/releases/latest");
+                }
+            }
+        }
+    }
+
+    let snapshot = {
+        let Ok(mut guard) = app.stream.lock() else {
+            return;
+        };
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        if state.applied {
+            return;
+        }
+        if state.done {
+            state.applied = true;
+            Some((
+                true,
+                state.model.clone(),
+                state.view.clone(),
+                state.note.clone(),
+                state.error.clone(),
+            ))
+        } else if state.view.text == state.painted && state.view.status == state.painted_status {
+            None
+        } else {
+            state.painted = state.view.text.clone();
+            state.painted_status = state.view.status.clone();
+            Some((
+                false,
+                state.model.clone(),
+                state.view.clone(),
+                state.note.clone(),
+                None,
+            ))
+        }
+    };
+    let Some((done, model, view, note, error)) = snapshot else {
+        return;
+    };
+    if done {
+        finish_turn(ui, &model, &view, error, &note);
+    } else {
+        paint_stream(ui, &model, &view, &note);
+    }
+}
+
+fn wire(ui: &AppWindow, tray: &RaskTray, cancel: Arc<AtomicBool>, app: Arc<AppState>) {
     let weak = ui.as_weak();
     ui.on_new_chat(move || {
         let Some(ui) = weak.upgrade() else { return };
@@ -84,16 +208,29 @@ fn wire(ui: &AppWindow, tray: &RaskTray, cancel: Arc<AtomicBool>) {
     let weak = ui.as_weak();
     ui.on_pick_model(move |index| {
         let Some(ui) = weak.upgrade() else { return };
+        if ui.get_suppress_persist() {
+            return;
+        }
         let name = model_at(&ui, index);
         {
             let mut store = store::lock();
+            let previous = store
+                .active()
+                .map(|chat| chat.model.clone())
+                .unwrap_or_default();
+            if !previous.is_empty() && previous != name {
+                let profile = profile_from_ui(&ui, &store.profile(&previous));
+                store.set_profile(&previous, profile);
+            }
             if let Some(chat) = store.active_mut() {
                 chat.model = name.clone();
                 chat.updated_at = store::now_ms();
             }
             let profile = store.profile(&name);
             let _ = store.save();
+            ui.set_suppress_persist(true);
             apply_profile(&ui, &profile);
+            ui.set_suppress_persist(false);
         }
         ui.set_model_index(index);
     });
@@ -117,15 +254,26 @@ fn wire(ui: &AppWindow, tray: &RaskTray, cancel: Arc<AtomicBool>) {
     });
 
     let weak = ui.as_weak();
-    ui.on_apply_settings(move || {
+    ui.on_persist(move || {
         let Some(ui) = weak.upgrade() else { return };
-        let err = apply_from_ui(&ui);
-        ui.set_status(err.unwrap_or_else(|e| e).into());
-        refresh_lists(&ui);
+        if let Err(err) = persist_from_ui(&ui, false) {
+            ui.set_status(err.into());
+        } else if !ui.get_api_key().trim().is_empty() && ui.get_status().contains("No search key") {
+            ui.set_status(String::new().into());
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_persist_autostart(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if let Err(err) = persist_from_ui(&ui, true) {
+            ui.set_status(err.into());
+        }
     });
 
     let weak = ui.as_weak();
     let cancel_send = cancel.clone();
+    let app_send = app.clone();
     ui.on_send(move |text| {
         let Some(ui) = weak.upgrade() else { return };
         let text = text.trim().to_string();
@@ -133,14 +281,34 @@ fn wire(ui: &AppWindow, tray: &RaskTray, cancel: Arc<AtomicBool>) {
             return;
         }
         cancel_send.store(false, Ordering::Relaxed);
-        if let Err(err) = begin_turn(&ui, text, cancel_send.clone()) {
-            ui.set_status(err.into());
-            ui.set_busy(false);
+        match begin_turn(&ui, text, cancel_send.clone(), app_send.clone()) {
+            Ok(()) => ui.set_draft(String::new().into()),
+            Err(err) => {
+                ui.set_status(err.into());
+                ui.set_busy(false);
+            }
         }
     });
 
     let cancel_stop = cancel.clone();
     ui.on_stop(move || cancel_stop.store(true, Ordering::Relaxed));
+
+    let weak = ui.as_weak();
+    let app_update = app.clone();
+    ui.on_install_update(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let offer = app_update.update.lock().ok().and_then(|slot| slot.clone());
+        let Some(offer) = offer else { return };
+        ui.set_update_busy(true);
+        ui.set_status("Downloading update…".into());
+        let app_update = app_update.clone();
+        std::thread::spawn(move || {
+            let result = update::download_installer(&offer.download_url, &offer.version);
+            if let Ok(mut slot) = app_update.download.lock() {
+                *slot = Some(result);
+            }
+        });
+    });
 
     let weak = ui.as_weak();
     tray.on_show_window(move || {
@@ -173,12 +341,22 @@ fn wire(ui: &AppWindow, tray: &RaskTray, cancel: Arc<AtomicBool>) {
         });
     });
 
-    tray.on_quit(|| {
+    let weak = ui.as_weak();
+    tray.on_quit(move || {
+        if let Some(ui) = weak.upgrade() {
+            let _ = persist_from_ui(&ui, false);
+        }
         let _ = slint::quit_event_loop();
     });
 }
 
-fn begin_turn(ui: &AppWindow, text: String, cancel: Arc<AtomicBool>) -> Result<(), String> {
+fn begin_turn(
+    ui: &AppWindow,
+    text: String,
+    cancel: Arc<AtomicBool>,
+    app: Arc<AppState>,
+) -> Result<(), String> {
+    let _ = persist_from_ui(ui, false);
     let request = {
         let mut store = store::lock();
         store.ensure_chat();
@@ -220,7 +398,7 @@ fn begin_turn(ui: &AppWindow, text: String, cancel: Arc<AtomicBool>) -> Result<(
             .rev()
             .collect();
         let profile = store.profile(&model);
-        let tools = !store.settings.search_api_key.trim().is_empty();
+        let has_key = !store.settings.search_api_key.trim().is_empty();
         let base_url = store.settings.ollama_url.clone();
         let idle_unload = store.settings.idle_unload.clone();
         let provider = store.settings.search_provider.clone();
@@ -234,23 +412,37 @@ fn begin_turn(ui: &AppWindow, text: String, cancel: Arc<AtomicBool>) -> Result<(
             provider,
             api_key,
             history,
-            tools,
+            tools: has_key,
         }
     };
 
-    ui.set_busy(true);
-    ui.set_status(
-        if request.tools {
-            String::new()
-        } else {
-            "No search API key — answering without the web.".into()
-        }
-        .into(),
-    );
-    refresh_lists(ui);
+    let note = if request.tools {
+        String::new()
+    } else {
+        "No search key saved — answering without the web.".into()
+    };
+    if let Ok(mut slot) = app.stream.lock() {
+        *slot = Some(StreamSlot {
+            model: request.model.clone(),
+            view: chat::TurnView {
+                text: String::new(),
+                sources: Vec::new(),
+                status: format!("Waiting for {}…", request.model),
+            },
+            note: note.clone(),
+            error: None,
+            done: false,
+            applied: false,
+            painted: String::new(),
+            painted_status: String::new(),
+        });
+    }
 
-    let weak = ui.as_weak();
-    let model_name = request.model.clone();
+    ui.set_busy(true);
+    ui.set_status(format!("Waiting for {}…", request.model).into());
+    refresh_lists(ui);
+    ui.invoke_scroll_to_bottom();
+
     std::thread::spawn(move || {
         let had_key = request.tools;
         let tools = if had_key {
@@ -258,79 +450,46 @@ fn begin_turn(ui: &AppWindow, text: String, cancel: Arc<AtomicBool>) -> Result<(
         } else {
             false
         };
-        if had_key && !tools {
-            let weak_note = weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = weak_note.upgrade() {
-                    ui.set_status("This model cannot search on its own.".into());
-                }
-            });
+        let note = if had_key && !tools {
+            "This model cannot search on its own.".into()
+        } else if !had_key {
+            "No search key saved — answering without the web.".into()
+        } else {
+            String::new()
+        };
+        if let Ok(mut slot) = app.stream.lock() {
+            if let Some(state) = slot.as_mut() {
+                state.note = note;
+            }
         }
         let mut request = request;
         request.tools = tools;
-        let latest = Arc::new(Mutex::new(chat::TurnView {
-            text: String::new(),
-            sources: Vec::new(),
-            status: String::new(),
-            done: false,
-        }));
-        let last_paint = Arc::new(Mutex::new(std::time::Instant::now()));
-        let view_slot = latest.clone();
-        let paint_slot = last_paint.clone();
-        let weak_stream = weak.clone();
-        let model_for_stream = model_name.clone();
+        let app_stream = app.clone();
         let result = chat::run(request, &cancel, move |view| {
-            let done = view.done;
-            let status_changed = view_slot
-                .lock()
-                .map(|g| g.status != view.status)
-                .unwrap_or(true);
-            if let Ok(mut slot) = view_slot.lock() {
-                *slot = view;
-            }
-            let due = paint_slot
-                .lock()
-                .map(|t| {
-                    t.elapsed() >= std::time::Duration::from_millis(40) || done || status_changed
-                })
-                .unwrap_or(true);
-            if !due {
-                return;
-            }
-            if let Ok(mut t) = paint_slot.lock() {
-                *t = std::time::Instant::now();
-            }
-            let weak_stream = weak_stream.clone();
-            let view_slot = view_slot.clone();
-            let model_for_stream = model_for_stream.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                let Some(ui) = weak_stream.upgrade() else {
-                    return;
-                };
-                if let Ok(view) = view_slot.lock() {
-                    paint_stream(&ui, &model_for_stream, &view);
+            if let Ok(mut slot) = app_stream.stream.lock() {
+                if let Some(state) = slot.as_mut() {
+                    state.view = view;
                 }
-            });
-        });
-
-        let weak_done = weak.clone();
-        let view = latest.lock().ok().map(|v| v.clone());
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(ui) = weak_done.upgrade() else {
-                return;
-            };
-            if let Some(view) = view {
-                finish_turn(&ui, &model_name, &view, result.err());
-            } else if let Err(err) = result {
-                ui.set_status(err.into());
-                ui.set_busy(false);
             }
         });
+        if let Ok(mut slot) = app.stream.lock() {
+            if let Some(state) = slot.as_mut() {
+                let stopped = cancel.load(Ordering::Relaxed) && state.view.text.is_empty();
+                state.error = result.err().or_else(|| stopped.then(|| "Stopped.".into()));
+                state.done = true;
+            }
+        }
     });
     Ok(())
 }
 
-fn finish_turn(ui: &AppWindow, model: &str, view: &chat::TurnView, error: Option<String>) {
+fn finish_turn(
+    ui: &AppWindow,
+    model: &str,
+    view: &chat::TurnView,
+    error: Option<String>,
+    note: &str,
+) {
     {
         let mut store = store::lock();
         if let Some(chat) = store.active_mut() {
@@ -360,11 +519,14 @@ fn finish_turn(ui: &AppWindow, model: &str, view: &chat::TurnView, error: Option
         let _ = store.save();
     }
     ui.set_busy(false);
-    ui.set_status(error.unwrap_or_default().into());
+    let status = error.unwrap_or_else(|| note.to_string());
+    ui.set_status(status.into());
     refresh_lists(ui);
+    ui.invoke_scroll_to_bottom();
+    ui.invoke_scroll_to_bottom();
 }
 
-fn paint_stream(ui: &AppWindow, model: &str, view: &chat::TurnView) {
+fn paint_stream(ui: &AppWindow, model: &str, view: &chat::TurnView, note: &str) {
     let model_rc = ui.get_messages();
     let mut bubbles = Vec::with_capacity(model_rc.row_count());
     for index in 0..model_rc.row_count() {
@@ -372,30 +534,41 @@ fn paint_stream(ui: &AppWindow, model: &str, view: &chat::TurnView) {
             bubbles.push(row);
         }
     }
+    let body = if view.text.is_empty() {
+        "…"
+    } else {
+        view.text.as_str()
+    };
     let sources = source_line(&view.sources);
     if let Some(last) = bubbles.last_mut() {
         if last.role.as_str() == model {
-            last.body = view.text.as_str().into();
+            last.body = body.into();
             last.sources = sources.into();
-        } else if !view.text.is_empty() || !view.status.is_empty() {
+        } else {
             bubbles.push(Bubble {
                 role: model.into(),
-                body: view.text.as_str().into(),
+                body: body.into(),
                 sources: sources.into(),
             });
         }
-    } else if !view.text.is_empty() {
+    } else {
         bubbles.push(Bubble {
             role: model.into(),
-            body: view.text.as_str().into(),
+            body: body.into(),
             sources: sources.into(),
         });
     }
     ui.set_messages(slint::ModelRc::new(slint::VecModel::from(bubbles)));
-    ui.set_scroll_y(-100_000.0);
-    if !view.status.is_empty() {
-        ui.set_status(view.status.clone().into());
-    }
+    let status = if !view.status.is_empty() {
+        view.status.clone()
+    } else if view.text.is_empty() {
+        format!("Waiting for {model}…")
+    } else {
+        note.to_string()
+    };
+    ui.set_status(status.into());
+    ui.invoke_scroll_to_bottom();
+    ui.invoke_scroll_to_bottom();
 }
 
 fn source_line(hits: &[search::Hit]) -> String {
@@ -450,7 +623,7 @@ fn refresh_lists(ui: &AppWindow) {
         })
         .unwrap_or_default();
     ui.set_messages(slint::ModelRc::new(slint::VecModel::from(messages)));
-    ui.set_scroll_y(-100_000.0);
+    ui.invoke_scroll_to_bottom();
     if let Some(chat) = store.active() {
         let names = model_names(ui);
         if let Some(index) = names.iter().position(|name| name == &chat.model) {
@@ -469,7 +642,9 @@ fn refresh_models(weak: slint::Weak<AppWindow>) {
                 if names.is_empty() {
                     names.push("No models".into());
                     ui.set_status("Ollama is up, but no models are installed.".into());
-                } else {
+                } else if ui.get_status().contains("Cannot reach Ollama")
+                    || ui.get_status().contains("no models")
+                {
                     ui.set_status(String::new().into());
                 }
                 let default_name = store::lock().settings.default_model.clone();
@@ -477,6 +652,7 @@ fn refresh_models(weak: slint::Weak<AppWindow>) {
                     .active()
                     .map(|chat| chat.model.clone())
                     .unwrap_or_default();
+                ui.set_suppress_persist(true);
                 ui.set_model_names(slint::ModelRc::new(slint::VecModel::from(
                     names
                         .iter()
@@ -503,22 +679,40 @@ fn refresh_models(weak: slint::Weak<AppWindow>) {
                 let model = model_at(&ui, ui.get_model_index());
                 let profile = store::lock().profile(&model);
                 apply_profile(&ui, &profile);
+                ui.set_suppress_persist(false);
             }
             Err(err) => ui.set_status(err.into()),
         }
     });
 }
 
-fn apply_from_ui(ui: &AppWindow) -> Result<String, String> {
+fn profile_from_ui(ui: &AppWindow, previous: &ModelProfile) -> ModelProfile {
+    let mut profile = previous.clone();
+    profile.system_prompt = ui.get_system_prompt().to_string();
+    profile.think = ui.get_think();
+    if let Ok(temperature) = ui.get_temperature().trim().parse::<f64>() {
+        profile.temperature = temperature.clamp(0.0, 2.0);
+    }
+    if let Ok(num_ctx) = ui.get_num_ctx().trim().parse::<u32>() {
+        if num_ctx >= 512 {
+            profile.num_ctx = num_ctx;
+        }
+    }
+    profile
+}
+
+fn persist_from_ui(ui: &AppWindow, autostart_changed: bool) -> Result<(), String> {
+    if ui.get_suppress_persist() {
+        return Ok(());
+    }
     let mut store = store::lock();
-    let previous_model = store
-        .active()
-        .map(|chat| chat.model.clone())
-        .unwrap_or_default();
-    store.settings.ollama_url = ollama::normalize_base(&ui.get_ollama_url());
-    store.settings.idle_unload = ui.get_idle_unload().trim().to_string();
-    if store.settings.idle_unload.is_empty() {
-        store.settings.idle_unload = "10m".into();
+    let url = ui.get_ollama_url().trim().to_string();
+    if !url.is_empty() {
+        store.settings.ollama_url = ollama::normalize_base(&url);
+    }
+    let idle = ui.get_idle_unload().trim().to_string();
+    if !idle.is_empty() {
+        store.settings.idle_unload = idle;
     }
     store.settings.autostart = ui.get_autostart();
     store.settings.start_minimized = ui.get_start_minimized();
@@ -533,31 +727,29 @@ fn apply_from_ui(ui: &AppWindow) -> Result<String, String> {
     let selected = names
         .get(ui.get_model_index() as usize)
         .cloned()
-        .unwrap_or(previous_model);
-    let temperature = ui
-        .get_temperature()
-        .parse::<f64>()
-        .unwrap_or(0.7)
-        .clamp(0.0, 2.0);
-    let num_ctx = ui.get_num_ctx().parse::<u32>().unwrap_or(8192).max(512);
-    store.set_profile(
-        &selected,
-        ModelProfile {
-            system_prompt: ui.get_system_prompt().to_string(),
-            temperature,
-            num_ctx,
-            think: ui.get_think(),
-        },
-    );
-    autostart::set_enabled(store.settings.autostart, store.settings.start_minimized)?;
+        .filter(|name| !name.is_empty() && name != "No models")
+        .or_else(|| {
+            store
+                .active()
+                .map(|chat| chat.model.clone())
+                .filter(|name| !name.is_empty())
+        });
+    if let Some(selected) = selected {
+        let profile = profile_from_ui(ui, &store.profile(&selected));
+        store.set_profile(&selected, profile);
+    }
+    if autostart_changed {
+        autostart::set_enabled(store.settings.autostart, store.settings.start_minimized)?;
+    }
     store.save()?;
-    Ok("Saved.".into())
+    Ok(())
 }
 
 fn load_settings_into(ui: &AppWindow) {
     let mut store = store::lock();
     store.ensure_chat();
     let _ = store.save();
+    ui.set_suppress_persist(true);
     ui.set_ollama_url(store.settings.ollama_url.clone().into());
     ui.set_idle_unload(store.settings.idle_unload.clone().into());
     ui.set_autostart(store.settings.autostart);
@@ -570,6 +762,7 @@ fn load_settings_into(ui: &AppWindow) {
         .unwrap_or_default();
     let profile = store.profile(&model);
     apply_profile(ui, &profile);
+    ui.set_suppress_persist(false);
 }
 
 fn apply_profile(ui: &AppWindow, profile: &ModelProfile) {
